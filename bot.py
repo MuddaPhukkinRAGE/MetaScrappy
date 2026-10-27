@@ -4,7 +4,6 @@ import time
 import aiohttp
 import discord
 from discord import app_commands
-from bs4 import BeautifulSoup
 TOKEN = os.getenv("DISCORD_TOKEN")
 BASE_URL = "https://metaforge.app/arc-raiders"
 API_BASE_URL = "https://metaforge.app/api/arc-raiders"
@@ -14,81 +13,75 @@ intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 price_cache = {}
-def make_slug(item: str) -> str:
+def make_slug(item):
     slug = item.lower().strip()
     slug = re.sub(r"[^a-z0-9]+", "-", slug)
     return slug.strip("-")
-async def fetch_price(item: str):
+async def fetch_price(item):
     slug = make_slug(item)
     item_url = f"{BASE_URL}/database/item/{slug}"
     cached = price_cache.get(slug)
-    if cached and time.time() - cached["time"] < CACHE_SECONDS:
-        return cached["price"], cached["url"]
+    if cached and time.time() - cached["cached_at"] < CACHE_SECONDS:
+        return (
+            cached["price"],
+            cached["url"],
+            cached["timestamp"],
+            cached["trade_count"],
+        )
+    api_url = (
+        f"{API_BASE_URL}/trade/stats/"
+        f"{slug}/prices?range=1d"
+    )
     headers = {
         "User-Agent": "Mozilla/5.0 MetaScrappy/1.0",
-        "Accept": "text/html,application/json",
+        "Accept": "application/json",
     }
     async with aiohttp.ClientSession(
         timeout=REQUEST_TIMEOUT,
         headers=headers,
     ) as session:
-        async with session.get(
-            item_url,
-            allow_redirects=True,
-        ) as response:
+        async with session.get(api_url) as response:
             if response.status != 200:
                 print(
-                    f"PRICE LOOKUP: Item page returned "
-                    f"HTTP {response.status}: {item_url}"
+                    f"PRICE LOOKUP: HTTP {response.status} "
+                    f"for {slug}"
                 )
-                return None, item_url
-            html = await response.text()
-    soup = BeautifulSoup(html, "html.parser")
-    # First try the rendered page text.
-    page_text = soup.get_text(" ", strip=True)
-    # Only accept a number located after the exact Marketplace Value
-    # heading. Do not use the unrelated historical median endpoint.
-    patterns = [
-        (
-            r"MetaForge\s+Marketplace\s+Value\s*"
-            r"\(\s*24h\s+Median\s*\)\s*"
-            r"([\d,]+)\s*Seeds?"
-        ),
-        (
-            r"Marketplace\s+Value\s*"
-            r"\(\s*24h\s+Median\s*\)\s*"
-            r"([\d,]+)\s*Seeds?"
-        ),
+                return None, item_url, None, None
+            payload = await response.json(content_type=None)
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list) or not data:
+        print(f"PRICE LOOKUP: No history data for {slug}")
+        return None, item_url, None, None
+    valid_points = [
+        point
+        for point in data
+        if isinstance(point, dict)
+        and isinstance(point.get("time"), (int, float))
+        and isinstance(point.get("median_price"), (int, float))
+        and point["median_price"] > 0
     ]
-    for pattern in patterns:
-        match = re.search(
-            pattern,
-            page_text,
-            re.IGNORECASE,
-        )
-        if match:
-            price = int(match.group(1).replace(",", ""))
-            price_cache[slug] = {
-                "price": price,
-                "url": item_url,
-                "time": time.time(),
-            }
-            print(
-                f"PRICE LOOKUP SUCCESS: {item} = "
-                f"{price} Seeds"
-            )
-            return price, item_url
-    # The page may be JavaScript-rendered, meaning the visible price
-    # is not present in the initial HTML. Record useful diagnostics.
-    print(
-        f"PRICE LOOKUP: Could not find the displayed "
-        f"24h Median in the HTML for {item}. "
-        f"Page title: {soup.title.get_text(strip=True) if soup.title else 'None'}"
+    if not valid_points:
+        print(f"PRICE LOOKUP: No valid median points for {slug}")
+        return None, item_url, None, None
+    # Select the newest point using its timestamp.
+    latest = max(
+        valid_points,
+        key=lambda point: point["time"],
     )
-    return None, item_url
+    price = int(latest["median_price"])
+    timestamp = int(latest["time"])
+    trade_count = latest.get("trade_count")
+    price_cache[slug] = {
+        "price": price,
+        "url": item_url,
+        "timestamp": timestamp,
+        "trade_count": trade_count,
+        "cached_at": time.time(),
+    }
+    return price, item_url, timestamp, trade_count
 @tree.command(
     name="price",
-    description="Look up an ARC Raiders Marketplace 24h Median price",
+    description="Look up the latest ARC Raiders price-history median",
 )
 @app_commands.describe(
     item="The ARC Raiders item name",
@@ -97,41 +90,42 @@ async def price(
     interaction: discord.Interaction,
     item: str,
 ):
-    # Acknowledge Discord immediately before making network requests.
+    # Acknowledge Discord immediately to prevent interaction timeouts.
     await interaction.response.defer(thinking=True)
     try:
-        value, item_url = await fetch_price(item)
+        value, item_url, timestamp, trade_count = await fetch_price(item)
         if value is None:
             await interaction.followup.send(
-                f"I couldn't verify the displayed 24h Median "
+                f"I couldn't find recent price-history data "
                 f"for **{item}**.\n"
                 f"Check the item page: {item_url}\n"
-                "I won't guess the price if MetaForge doesn't "
-                "expose it in the page HTML."
+                f"I won't guess the price."
             )
             return
-        await interaction.followup.send(
+        message = (
             f"**{item} — {value:,} Assorted Seeds**\n"
-            "Marketplace Value (24h Median)\n"
+            f"Latest recorded median in the 1-day price history. "
+            f"This may differ from the value displayed on the item page.\n"
+            f"Data point: <t:{int(timestamp / 1000)}:R>\n"
             f"Source: [MetaForge]({item_url})"
         )
+        if isinstance(trade_count, (int, float)):
+            message += (
+                f"\nTrades recorded for this data point: "
+                f"{int(trade_count)}"
+            )
+        await interaction.followup.send(message)
     except (aiohttp.ClientError, TimeoutError) as error:
-        print(
-            f"PRICE LOOKUP NETWORK ERROR: "
-            f"{type(error).__name__}: {error}"
-        )
+        print(f"PRICE LOOKUP: Network error for {item}: {error}")
         await interaction.followup.send(
-            "MetaForge didn't respond in time. "
+            "MetaForge's price-history endpoint didn't respond. "
             "Please try again shortly."
         )
     except Exception as error:
-        print(
-            f"PRICE LOOKUP ERROR: "
-            f"{type(error).__name__}: {error}"
-        )
+        print(f"PRICE LOOKUP: Unexpected error for {item}: {error}")
         await interaction.followup.send(
             "The price lookup encountered an unexpected error. "
-            "Please check the bot logs."
+            "Please try again later."
         )
 @client.event
 async def on_ready():
@@ -139,6 +133,6 @@ async def on_ready():
     print(f"MetaScrappy is online as {client.user}")
 if not TOKEN:
     raise RuntimeError(
-        "DISCORD_TOKEN environment variable is missing"
+        "DISCORD_TOKEN is missing from the environment variables."
     )
 client.run(TOKEN)
