@@ -8,15 +8,66 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 BASE_URL = "https://metaforge.app/arc-raiders"
 API_BASE_URL = "https://metaforge.app/api/arc-raiders"
 CACHE_SECONDS = 600
+ITEM_CACHE_SECONDS = 3600
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=15)
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 price_cache = {}
+item_names = []
+item_cache_time = 0
 def make_slug(item):
     slug = item.lower().strip()
     slug = re.sub(r"[^a-z0-9]+", "-", slug)
     return slug.strip("-")
+async def load_item_names():
+    global item_names, item_cache_time
+    if item_names and time.time() - item_cache_time < ITEM_CACHE_SECONDS:
+        return item_names
+    url = f"{API_BASE_URL}/items"
+    headers = {
+        "User-Agent": "Mozilla/5.0 MetaScrappy/1.0",
+        "Accept": "application/json",
+    }
+    try:
+        async with aiohttp.ClientSession(
+            timeout=REQUEST_TIMEOUT,
+            headers=headers,
+        ) as session:
+            async with session.get(url) as response:
+                response.raise_for_status()
+                payload = await response.json(content_type=None)
+        # Accept common API response structures.
+        if isinstance(payload, dict):
+            data = payload.get("data", payload.get("items", []))
+        elif isinstance(payload, list):
+            data = payload
+        else:
+            data = []
+        names = set()
+        for entry in data:
+            if isinstance(entry, str):
+                name = entry.strip()
+            elif isinstance(entry, dict):
+                name = (
+                    entry.get("name")
+                    or entry.get("displayName")
+                    or entry.get("display_name")
+                    or ""
+                )
+                name = str(name).strip()
+            else:
+                continue
+            if name:
+                names.add(name)
+        if names:
+            item_names = sorted(names, key=str.casefold)
+            item_cache_time = time.time()
+            print(f"ITEM AUTOCOMPLETE: Loaded {len(item_names)} names")
+        return item_names
+    except Exception as error:
+        print(f"ITEM AUTOCOMPLETE: Could not load item names: {error}")
+        return item_names
 async def fetch_price(item):
     slug = make_slug(item)
     item_url = f"{BASE_URL}/database/item/{slug}"
@@ -43,8 +94,7 @@ async def fetch_price(item):
         async with session.get(api_url) as response:
             if response.status != 200:
                 print(
-                    f"PRICE LOOKUP: HTTP {response.status} "
-                    f"for {slug}"
+                    f"PRICE LOOKUP: HTTP {response.status} for {slug}"
                 )
                 return None, item_url, None, None
             payload = await response.json(content_type=None)
@@ -63,11 +113,7 @@ async def fetch_price(item):
     if not valid_points:
         print(f"PRICE LOOKUP: No valid median points for {slug}")
         return None, item_url, None, None
-    # Select the newest point using its timestamp.
-    latest = max(
-        valid_points,
-        key=lambda point: point["time"],
-    )
+    latest = max(valid_points, key=lambda point: point["time"])
     price = int(latest["median_price"])
     timestamp = int(latest["time"])
     trade_count = latest.get("trade_count")
@@ -81,24 +127,18 @@ async def fetch_price(item):
     return price, item_url, timestamp, trade_count
 @tree.command(
     name="price",
-    description="Look up the latest ARC Raiders price-history median",
+    description="Look up an ARC Raiders item's price history",
 )
-@app_commands.describe(
-    item="The ARC Raiders item name",
-)
-async def price(
-    interaction: discord.Interaction,
-    item: str,
-):
-    # Acknowledge Discord immediately to prevent interaction timeouts.
+@app_commands.describe(item="Start typing an item name")
+async def price(interaction: discord.Interaction, item: str):
     await interaction.response.defer(thinking=True)
     try:
         value, item_url, timestamp, trade_count = await fetch_price(item)
         if value is None:
             await interaction.followup.send(
-                f"I couldn't find recent price-history data "
-                f"for **{item}**.\n"
-                f"Check the item page: {item_url}\n"
+                f"I couldn't find recent price-history data for "
+                f"**{item}**.\n"
+                f"Check MetaForge: {item_url}\n"
                 f"I won't guess the price."
             )
             return
@@ -127,6 +167,34 @@ async def price(
             "The price lookup encountered an unexpected error. "
             "Please try again later."
         )
+@price.autocomplete("item")
+async def item_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+):
+    names = await load_item_names()
+    if not names:
+        return []
+    query = current.strip().casefold()
+    if not query:
+        matches = names[:25]
+    else:
+        # Prioritize names that start with what the user typed.
+        starts_with = [
+            name for name in names
+            if name.casefold().startswith(query)
+        ]
+        # Then include names containing the typed text.
+        contains = [
+            name for name in names
+            if query in name.casefold()
+            and not name.casefold().startswith(query)
+        ]
+        matches = (starts_with + contains)[:25]
+    return [
+        app_commands.Choice(name=name[:100], value=name[:100])
+        for name in matches
+    ]
 @client.event
 async def on_ready():
     await tree.sync()
