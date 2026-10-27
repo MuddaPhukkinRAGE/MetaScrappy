@@ -21,7 +21,7 @@ def make_slug(item: str) -> str:
 async def fetch_price(item: str):
     """Try to read the displayed 24-hour median from a MetaForge item page."""
     slug = make_slug(item)
-    url = f"{BASE_URL}/database/items/{slug}"
+    url = f"{BASE_URL}/database/item/{slug}"
     cached = price_cache.get(slug)
     if cached and time.time() - cached["time"] < CACHE_SECONDS:
         return cached["price"], cached["url"]
